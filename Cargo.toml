@@ -1,0 +1,23 @@
+[package]
+name = "ecs-cluster-discovery"
+version = "0.1.0"
+edition = "2021"
+description = "Automatic peer discovery within ECS clusters (EC2 and FARGATE)"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+thiserror = "1"
+tracing = "0.1.40"
+serde_derive = "1"
+serde_json = "1"
+serde = "1"
+ipnet = "2.9.0"
+
+aws-config = "1.1.7"
+aws-sdk-ecs = "1.16.0"
+
+tokio = { version = "1", features = ["time", "fs"] }
+
+[dev-dependencies]
+tokio = { version = "1.36.0", features = ["full"] }
