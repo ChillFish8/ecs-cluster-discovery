@@ -1,6 +1,6 @@
 pub mod metadata;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
@@ -11,7 +11,7 @@ use aws_sdk_ecs::Client;
 use tracing::warn;
 
 type ServiceWeights = BTreeMap<String, f32>;
-type PeersByService = BTreeMap<String, HashSet<String>>;
+type PeersByService = BTreeMap<String, BTreeSet<String>>;
 
 #[derive(Debug, thiserror::Error)]
 #[error("Failed to get peers due to error: {0}")]
@@ -32,6 +32,29 @@ impl From<io::Error> for GetPeersError {
 /// This builder provided some level of filtering and granularity
 /// of what peers are selected, including filtering by service name prefix
 /// and limiting the number of peers returned based on some weight.
+///
+/// ```no_run
+/// # #[tokio::main]
+/// # async fn main() {
+/// use ecs_cluster_discovery::GetPeersBuilder;
+///
+/// let subnet = "10.1.0.0/16".parse().unwrap();
+/// let peer_ips = GetPeersBuilder::new(subnet)
+///     // Select only tasks from the [`indexer-service`].
+///     .with_service_filter("indexer-service")
+///     // Select only tasks in [`search-service`, `indexer-service`] services.
+///     .with_service_filter("search-service")
+///     // 50% of the peers should be from the search-service if available
+///     .with_service_weight("search-service", 0.5)  
+///     // Always return at least 1 peer for each service if available.
+///     .with_at_least_one_peer_per_service()
+///     // Return no more than 10 peers.
+///     .with_max_peers(10)
+///     .execute()
+///     .await
+///     .expect("Retrieve ECS cluster peers");
+/// # }
+/// ```
 pub struct GetPeersBuilder {
     subnet: ipnet::IpNet,
     services: Vec<String>,
@@ -64,7 +87,7 @@ impl GetPeersBuilder {
     ///
     /// NOTE: This filter is always a _exact_ match.
     pub fn with_service_filter(mut self, service: impl Display) -> Self {
-        let service = service.to_string().to_lowercase();        
+        let service = service.to_string().to_lowercase();
         self.services.push(service);
         self
     }
@@ -114,7 +137,7 @@ impl GetPeersBuilder {
 
     /// Execute the request to get the cluster peer addresses.
     ///
-    /// This uses the auto-loaded AWS SDK config which may not be desired
+    /// This uses the autoloaded AWS SDK config which may not be desired
     /// if you need a custom client, please see [GetPeersBuilder::execute_with_sdk_config]
     /// if you need more control over the SDK client.
     pub async fn execute(self) -> Result<Vec<String>, GetPeersError> {
@@ -291,17 +314,19 @@ async fn discover_service_names(
         .map_err(|e| GetPeersError(e.to_string()))?;
 
     // arn:aws:ecs:us-east-1:xxxxxxx:service/ecs-cluster/service-name -> service-name
-    let mut service_names = Vec::new();
-    for arn in cluster_services.service_arns.unwrap_or_default() {
-        match arn.rsplit_once('/') {
-            None => continue,
-            Some((_, service_name)) => {
-                service_names.push(service_name.to_string());
-            },
-        }
-    }
+    let service_names = cluster_services
+        .service_arns
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(parse_arn_to_name)
+        .collect();
 
     Ok(service_names)
+}
+
+fn parse_arn_to_name(arn: String) -> Option<String> {
+    let (_, service_name) = arn.rsplit_once('/')?;
+    Some(service_name.to_lowercase())
 }
 
 fn filter_peers_with_bias(
@@ -316,7 +341,7 @@ fn filter_peers_with_bias(
 
     let mut normalized_weights = normalize_weights(weights);
     add_default_service_weights(&peers_by_service, &mut normalized_weights);
-    
+
     let max_peers_by_service =
         get_max_peers_per_service(normalized_weights, max_peers, at_least_one);
 
@@ -338,25 +363,28 @@ fn add_default_service_weights(
     weights: &mut ServiceWeights,
 ) {
     let total_services = peers_by_service.len();
-    let total_pre_weighted_services = weights.len();
-    
+
     weights.retain(|service, _| peers_by_service.contains_key(service));
-    
+    let total_pre_weighted_services = weights.len();
+
     let total_non_weighted_services = total_services - total_pre_weighted_services;
-    let default_weight = total_non_weighted_services as f32 / total_services as f32;
-    
+    let total_non_weighted_ratio =
+        total_non_weighted_services as f32 / total_services as f32;
+    let per_service_default_weight =
+        total_non_weighted_ratio / total_non_weighted_services as f32;
+
     for service in peers_by_service.keys() {
         if weights.contains_key(service) {
-            continue
+            continue;
         }
-        
-        weights.insert(service.clone(), default_weight);
+
+        weights.insert(service.clone(), per_service_default_weight);
     }
 }
 
 fn normalize_weights(weights: ServiceWeights) -> ServiceWeights {
     let total = weights.values().sum::<f32>();
-        
+
     weights
         .into_iter()
         .map(|(service, relative_weight)| (service, relative_weight / total))
@@ -371,7 +399,7 @@ fn get_max_peers_per_service(
     weights
         .into_iter()
         .map(|(service, weight)| {
-            let mut n = (max_peers as f32 / weight) as usize;
+            let mut n = (max_peers as f32 * weight) as usize;
 
             if n == 0 && at_least_one {
                 n = 1;
@@ -386,4 +414,203 @@ fn get_max_peers_per_service(
             (service, n)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_max_peers_per_service_equal_split() {
+        let mut weights = ServiceWeights::new();
+        weights.insert("service-1".to_string(), 0.5);
+        weights.insert("service-2".to_string(), 0.5);
+        let mut num_peers = get_max_peers_per_service(weights, 10, true);
+        assert_eq!(num_peers.remove("service-1"), Some(5));
+        assert_eq!(num_peers.remove("service-2"), Some(5));
+
+        let mut weights = ServiceWeights::new();
+        weights.insert("service-1".to_string(), 0.5);
+        weights.insert("service-2".to_string(), 0.5);
+        let mut num_peers = get_max_peers_per_service(weights, 1, true);
+        assert_eq!(num_peers.remove("service-1"), Some(1));
+        assert_eq!(num_peers.remove("service-2"), Some(1));
+
+        let mut weights = ServiceWeights::new();
+        weights.insert("service-1".to_string(), 0.5);
+        weights.insert("service-2".to_string(), 0.5);
+        let mut num_peers = get_max_peers_per_service(weights, 7, true);
+        assert_eq!(num_peers.remove("service-1"), Some(3));
+        assert_eq!(num_peers.remove("service-2"), Some(3));
+    }
+
+    #[test]
+    fn test_get_max_peers_per_service_distribution() {
+        let mut weights = ServiceWeights::new();
+        weights.insert("service-1".to_string(), 0.2);
+        weights.insert("service-2".to_string(), 0.4);
+        weights.insert("service-3".to_string(), 0.3);
+        weights.insert("service-4".to_string(), 0.1);
+        let mut num_peers = get_max_peers_per_service(weights, 10, true);
+        assert_eq!(num_peers.remove("service-1"), Some(2));
+        assert_eq!(num_peers.remove("service-2"), Some(4));
+        assert_eq!(num_peers.remove("service-3"), Some(3));
+        assert_eq!(num_peers.remove("service-4"), Some(1));
+
+        let mut weights = ServiceWeights::new();
+        weights.insert("service-1".to_string(), 0.2);
+        weights.insert("service-2".to_string(), 0.4);
+        weights.insert("service-3".to_string(), 0.3);
+        weights.insert("service-4".to_string(), 0.1);
+        let mut num_peers = get_max_peers_per_service(weights, 5, true);
+        assert_eq!(num_peers.remove("service-1"), Some(1));
+        assert_eq!(num_peers.remove("service-2"), Some(2));
+        assert_eq!(num_peers.remove("service-3"), Some(1));
+        assert_eq!(num_peers.remove("service-4"), Some(1));
+
+        let mut weights = ServiceWeights::new();
+        weights.insert("service-1".to_string(), 0.2);
+        weights.insert("service-2".to_string(), 0.4);
+        weights.insert("service-3".to_string(), 0.3);
+        weights.insert("service-4".to_string(), 0.1);
+        let mut num_peers = get_max_peers_per_service(weights, 5, false);
+        assert_eq!(num_peers.remove("service-1"), Some(1));
+        assert_eq!(num_peers.remove("service-2"), Some(2));
+        assert_eq!(num_peers.remove("service-3"), Some(1));
+        assert_eq!(num_peers.remove("service-4"), Some(0));
+    }
+
+    #[test]
+    fn test_normalize_weights() {
+        let mut weights = ServiceWeights::new();
+        weights.insert("service-1".to_string(), 1.2);
+        weights.insert("service-2".to_string(), 1.4);
+        weights.insert("service-3".to_string(), 1.1);
+        let mut normalized = normalize_weights(weights);
+        assert_eq!(normalized.remove("service-1"), Some(0.32432434));
+        assert_eq!(normalized.remove("service-2"), Some(0.3783784));
+        assert_eq!(normalized.remove("service-3"), Some(0.29729733));
+    }
+
+    #[test]
+    fn test_default_weights() {
+        let mut peers = PeersByService::new();
+        peers.insert("service-1".to_string(), BTreeSet::default());
+        peers.insert("service-2".to_string(), BTreeSet::default());
+        let mut weights = ServiceWeights::new();
+        add_default_service_weights(&peers, &mut weights);
+        assert_eq!(weights.remove("service-1"), Some(0.5));
+        assert_eq!(weights.remove("service-2"), Some(0.5));
+
+        let mut peers = PeersByService::new();
+        peers.insert("service-1".to_string(), BTreeSet::default());
+        peers.insert("service-2".to_string(), BTreeSet::default());
+        peers.insert("service-3".to_string(), BTreeSet::default());
+        peers.insert("service-4".to_string(), BTreeSet::default());
+        let mut weights = ServiceWeights::new();
+        weights.insert("service-3".to_string(), 0.2);
+        weights.insert("service-4".to_string(), 0.2);
+        add_default_service_weights(&peers, &mut weights);
+        assert_eq!(weights.remove("service-1"), Some(0.25));
+        assert_eq!(weights.remove("service-2"), Some(0.25));
+        assert_eq!(weights.remove("service-3"), Some(0.2));
+        assert_eq!(weights.remove("service-4"), Some(0.2));
+    }
+
+    #[test]
+    fn test_subnet_validation() {
+        let subnet: ipnet::IpNet = "10.1.0.0/16".parse().unwrap();
+        validate_host_within_subnet(&subnet, "10.1.198.20".parse().unwrap())
+            .expect("Valid IP");
+        validate_host_within_subnet(&subnet, "11.1.198.20".parse().unwrap())
+            .expect_err("Invalid IP");
+        validate_host_within_subnet(&subnet, "10.2.198.20".parse().unwrap())
+            .expect_err("Invalid IP");
+    }
+
+    #[test]
+    fn test_filter_peers_with_bias() {
+        let mut peers = PeersByService::new();
+        peers.insert(
+            "service-1".to_string(),
+            BTreeSet::from_iter(["demo-1".to_owned()]),
+        );
+        peers.insert(
+            "service-2".to_string(),
+            BTreeSet::from_iter(["demo-2".to_owned()]),
+        );
+        let mut weights = ServiceWeights::new();
+        weights.insert("service-1".to_string(), 0.5);
+        weights.insert("service-2".to_string(), 0.5);
+        let selected = filter_peers_with_bias(peers, weights, 10, false);
+        assert_eq!(selected, ["demo-1", "demo-2"]);
+
+        let mut peers = PeersByService::new();
+        peers.insert(
+            "service-1".to_string(),
+            BTreeSet::from_iter(["demo-1".to_owned()]),
+        );
+        peers.insert("service-2".to_string(), BTreeSet::from_iter([]));
+        let mut weights = ServiceWeights::new();
+        weights.insert("service-1".to_string(), 0.5);
+        weights.insert("service-2".to_string(), 0.5);
+        let selected = filter_peers_with_bias(peers, weights, 10, false);
+        assert_eq!(selected, ["demo-1"]);
+
+        let mut peers = PeersByService::new();
+        peers.insert(
+            "service-1".to_string(),
+            BTreeSet::from_iter([
+                "demo-1".to_owned(),
+                "demo-2".to_owned(),
+                "demo-3".to_owned(),
+            ]),
+        );
+        peers.insert(
+            "service-2".to_string(),
+            BTreeSet::from_iter(["demo-4".to_owned()]),
+        );
+        let mut weights = ServiceWeights::new();
+        weights.insert("service-1".to_string(), 0.75);
+        weights.insert("service-2".to_string(), 0.25);
+        // NOTE:
+        //   This is a more pathological situation where the bias weighting is causing service-2 to
+        //   have no peers selected, this is why at_least_one was added, which correctly resolves
+        //   this issue.
+        let selected = filter_peers_with_bias(peers, weights, 3, false);
+        assert_eq!(selected, ["demo-1", "demo-2"]);
+
+        let mut peers = PeersByService::new();
+        peers.insert(
+            "service-1".to_string(),
+            BTreeSet::from_iter([
+                "demo-1".to_owned(),
+                "demo-2".to_owned(),
+                "demo-3".to_owned(),
+            ]),
+        );
+        peers.insert(
+            "service-2".to_string(),
+            BTreeSet::from_iter(["demo-4".to_owned()]),
+        );
+        let mut weights = ServiceWeights::new();
+        weights.insert("service-1".to_string(), 0.75);
+        weights.insert("service-2".to_string(), 0.25);
+        let selected = filter_peers_with_bias(peers, weights, 3, true);
+        assert_eq!(selected, ["demo-1", "demo-2", "demo-4"]);
+    }
+
+    #[test]
+    fn test_parse_arn_service_name() {
+        let arn = "arn:aws:ecs:us-east-1:xxxxxxx:service/ecs-cluster/service-name";
+        assert_eq!(
+            parse_arn_to_name(arn.to_string()).as_deref(),
+            Some("service-name")
+        );
+        let arn = "arn:aws:ecs:us-east-1:xxxxxxx:service/ecs-cluster/servIceNaMe";
+        assert_eq!(
+            parse_arn_to_name(arn.to_string()).as_deref(),
+            Some("servicename")
+        );
+    }
 }

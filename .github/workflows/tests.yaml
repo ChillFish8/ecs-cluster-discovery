@@ -1,0 +1,17 @@
+name: Run Tests
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout Branch
+        uses: actions/checkout@v3
+      - name: Run main tests
+        run: cargo test

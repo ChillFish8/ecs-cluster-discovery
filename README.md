@@ -21,3 +21,19 @@ system does the following:
 - Weighting selected peers based on service bias (i.e. service `A` should have more peers selected than service `B`.)
 - Retrieval of both internal DNS name and VPC IPv4 address.
 - Automatic subnet validation
+
+
+### What this library doesn't do
+
+- Detect what port the peer servers are listening on
+- Do multi-VPC handling
+- Cross-cluster discovery (By this point AWS Cloud Map will be easier)
+
+### Required AWS Permissions
+
+- `ecs:ListTasks`
+- `ecs:ListServices`
+- `ecs:DescribeTasks`
+
+These permissions must be granted at least to the cluster
+the host is running on.
