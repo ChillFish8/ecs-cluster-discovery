@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use aws_config::BehaviorVersion;
 use aws_sdk_ecs::types::DesiredStatus;
 use aws_sdk_ecs::Client;
-use tracing::warn;
+use tracing::{debug, info, instrument, warn};
 
 type ServiceWeights = BTreeMap<String, f32>;
 type PeersByService = BTreeMap<String, BTreeSet<String>>;
@@ -175,6 +175,7 @@ impl GetPeersBuilder {
         Ok(peers)
     }
 
+    #[instrument("peers", skip(self, client, peers_by_service))]
     async fn select_peers(
         &self,
         client: &Client,
@@ -186,6 +187,12 @@ impl GetPeersBuilder {
                 .await?;
 
         for (service, tasks) in tasks_by_service {
+            debug!(
+                service = service,
+                num_tasks = tasks.len(),
+                "Service tasks received"
+            );
+
             let peers = fetch_peers_from_tasks(
                 client,
                 cluster_name,
@@ -259,6 +266,7 @@ async fn fetch_peers_from_tasks(
 
                 // Validate the given IP lies within the defined subnet.
                 if !subnet.contains(&IpAddr::V4(ip)) {
+                    info!(ip = %ip, subnet = %subnet, "Ip not within VPC subnet, skipping...");
                     return None;
                 }
 
@@ -286,6 +294,8 @@ async fn fetch_tasks_for_services(
 
     let mut tasks_by_service = BTreeMap::new();
     for service in services {
+        debug!(service = service, "Fetching running tasks for service");
+
         let service_tasks = client
             .list_tasks()
             .cluster(cluster_name)
